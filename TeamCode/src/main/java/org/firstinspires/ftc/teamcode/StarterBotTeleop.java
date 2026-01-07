@@ -1,4 +1,4 @@
-/* hi
+/*
  * Copyright (c) 2025 FIRST
  * All rights reserved.
  *
@@ -44,208 +44,241 @@ import com.qualcomm.robotcore.hardware.PIDFCoefficients;
 import com.qualcomm.robotcore.util.ElapsedTime;
 
 /*
- * This file includes a teleop (driver-controlled) file for the goBILDA® StarterBot for the
- * 2025-2026 FIRST® Tech Challenge season DECODE™. It leverages a differential/Skid-Steer
- * system for robot mobility, one high-speed motor driving two "launcher wheels", and two servos
- * which feed that launcher.
+ * StarterBotTeleopWithToggleBrake (Logitech F310 friendly)
  *
- * Likely the most niche concept we'll use in this example is closed-loop motor velocity control.
- * This control method reads the current speed as reported by the motor's encoder and applies a varying
- * amount of power to reach, and then hold a target velocity. The FTC SDK calls this control method
- * "RUN_USING_ENCODER". This contrasts to the default "RUN_WITHOUT_ENCODER" where you control the power
- * applied to the motor directly.
- * Since the dynamics of a launcher wheel system varies greatly from those of most other FTC mechanisms,
- * we will also need to adjust the "PIDF" coefficients with some that are a better fit for our application.
+ * - Preserves original teleop functionality (arcade drive, launcher velocity control,
+ *   feeder servos and launch state machine).
+ * - Adds a toggleable, robust "hold position" brake bound to L1 (left bumper on Logitech F310).
+ *     * Press L1 once to toggle Brake Mode ON, press again to toggle OFF.
+ * - No rumble or other confirmation is performed when toggling (per request).
+ *
+ * Brake implementation details:
+ * - When enabled we:
+ *     * save the drive motors' current run mode,
+ *     * record the current encoder positions,
+ *     * set the motors to RUN_TO_POSITION with their current position as the target,
+ *     * set motor power to 1.0 so the controller actively holds position,
+ *     * ensure zeroPowerBehavior is BRAKE and repeatedly force power to the motors while
+ *       brake mode is active.
+ * - When disabled we:
+ *     * restore the motors' previous run modes and allow normal arcade driving to resume.
+ *
+ * Note: This actively holds position; extreme physical forces may still move the robot if
+ * the motors/gearbox/current limit cannot supply the torque required.
  */
 
-@TeleOp(name = "StarterBotTeleop", group = "StarterBot")
+@TeleOp(name = "StarterBotTeleop (Toggle Brake L1 - F310)", group = "StarterBot")
 //@Disabled
 public class StarterBotTeleop extends OpMode {
-    final double FEED_TIME_SECONDS = 0.5; //The feeder servos run this long when a shot is requested.
-    final double STOP_SPEED = 0.0; //We send this power to the servos when we want them to stop.
-    final double FULL_SPEED = 1.0;
+    final double FEED_TIME_SECONDS = 0.5; // The feeder servos run this long when a shot is requested.
+    final double STOP_SPEED = 0.0; // Servo stop
+    final double FULL_SPEED = 0.75;
 
-    /*
-     * When we control our launcher motor, we are using encoders. These allow the control system
-     * to read the current speed of the motor and apply more or less power to keep it at a constant
-     * velocity. Here we are setting the target, and minimum velocity that the launcher should run
-     * at. The minimum velocity is a threshold for determining when to fire.
-     */
-    final double LAUNCHER_TARGET_VELOCITY = 1350 ;
-    final double LAUNCHER_MIN_VELOCITY = 1700;
+    final double LAUNCHER_TARGET_VELOCITY = 1350;
+    final double LAUNCHER_MIN_VELOCITY = 1300;
 
-    // Declare OpMode members.
+    // Drive & mechanism members
     private DcMotor leftDrive = null;
     private DcMotor rightDrive = null;
     private DcMotorEx launcher = null;
     private CRServo leftFeeder = null;
     private CRServo rightFeeder = null;
 
+    // Timers & state
     ElapsedTime feederTimer = new ElapsedTime();
 
-    /*
-     * TECH TIP: State Machines
-     * We use a "state machine" to control our launcher motor and feeder servos in this program.
-     * The first step of a state machine is creating an enum that captures the different "states"
-     * that our code can be in.
-     * The core advantage of a state machine is that it allows us to continue to loop through all
-     * of our code while only running specific code when it's necessary. We can continuously check
-     * what "State" our machine is in, run the associated code, and when we are done with that step
-     * move on to the next state.
-     * This enum is called the "LaunchState". It reflects the current condition of the shooter
-     * motor and we move through the enum when the user asks our code to fire a shot.
-     * It starts at idle, when the user requests a launch, we enter SPIN_UP where we get the
-     * motor up to speed, once it meets a minimum speed then it starts and then ends the launch process.
-     * We can use higher level code to cycle through these states. But this allows us to write
-     * functions and autonomous routines in a way that avoids loops within loops, and "waits".
-     */
     private enum LaunchState {
         IDLE,
         SPIN_UP,
         LAUNCH,
         LAUNCHING,
     }
-
     private LaunchState launchState;
 
-    // Setup a variable for each drive wheel to save power level for telemetry
+    // Drive telemetry
     double leftPower;
     double rightPower;
 
-    /*
-     * Code to run ONCE when the driver hits INIT
-     */
+    // Brake toggle state
+    private boolean brakeActive = false;
+    private DcMotor.RunMode leftPrevMode = null;
+    private DcMotor.RunMode rightPrevMode = null;
+
+    // Manual rising-edge detection state (works for Logitech F310 mapping)
+    private boolean prevLeftBumper = false;   // for L1 toggle
+    private boolean prevRightBumper = false;  // for right bumper launch
+
     @Override
     public void init() {
         launchState = LaunchState.IDLE;
 
-        /*
-         * Initialize the hardware variables. Note that the strings used here as parameters
-         * to 'get' must correspond to the names assigned during the robot configuration
-         * step.
-         */
+        // Hardware map
         leftDrive = hardwareMap.get(DcMotor.class, "left_drive");
         rightDrive = hardwareMap.get(DcMotor.class, "right_drive");
         launcher = hardwareMap.get(DcMotorEx.class, "launcher");
         leftFeeder = hardwareMap.get(CRServo.class, "left_feeder");
         rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
-        /*
-         * To drive forward, most robots need the motor on one side to be reversed,
-         * because the axles point in opposite directions. Pushing the left stick forward
-         * MUST make robot go forward. So adjust these two lines based on your first test drive.
-         * Note: The settings here assume direct drive on left and right wheels. Gear
-         * Reduction or 90 Deg drives may require direction flips
-         */
+        // Motor directions
         leftDrive.setDirection(DcMotor.Direction.REVERSE);
         rightDrive.setDirection(DcMotor.Direction.FORWARD);
 
-        /*
-         * Here we set our launcher to the RUN_USING_ENCODER runmode.
-         * If you notice that you have no control over the velocity of the motor, it just jumps
-         * right to a number much higher than your set point, make sure that your encoders are plugged
-         * into the port right beside the motor itself. And that the motors polarity is consistent
-         * through any wiring.
-         */
+        // Launcher encoder mode & PIDF
         launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-
-        /*
-         * Setting zeroPowerBehavior to BRAKE enables a "brake mode". This causes the motor to
-         * slow down much faster when it is coasting. This creates a much more controllable
-         * drivetrain. As the robot stops much quicker.
-         */
-        leftDrive.setZeroPowerBehavior(BRAKE);
-        rightDrive.setZeroPowerBehavior(BRAKE);
+        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER, new PIDFCoefficients(300, 0, 0, 10));
         launcher.setZeroPowerBehavior(BRAKE);
 
-        /*
-         * set Feeders to an initial value to initialize the servo controller
-         */
+        // Drive brake behavior by default (safe)
+        leftDrive.setZeroPowerBehavior(BRAKE);
+        rightDrive.setZeroPowerBehavior(BRAKE);
+
+        // Initialize feeders
         leftFeeder.setPower(STOP_SPEED);
         rightFeeder.setPower(STOP_SPEED);
-
-        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER, new PIDFCoefficients(300, 0, 0, 10));
-
-        /*
-         * Much like our drivetrain motors, we set the left feeder servo to reverse so that they
-         * both work to feed the ball into the robot.
-         */
         leftFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
 
-        /*
-         * Tell the driver that initialization is complete.
-         */
         telemetry.addData("Status", "Initialized");
     }
 
-    /*
-     * Code to run REPEATEDLY after the driver hits INIT, but before they hit START
-     */
     @Override
-    public void init_loop() {
-    }
+    public void init_loop() { }
 
-    /*
-     * Code to run ONCE when the driver hits START
-     */
     @Override
-    public void start() {
-    }
+    public void start() { }
 
-    /*
-     * Code to run REPEATEDLY after the driver hits START but before they hit STOP
-     */
     @Override
     public void loop() {
-        /*
-         * Here we call a function called arcadeDrive. The arcadeDrive function takes the input from
-         * the joysticks, and applies power to the left and right drive motor to move the robot
-         * as requested by the driver. "arcade" refers to the control style we're using here.
-         * Much like a classic arcade game, when you move the left joystick forward both motors
-         * work to drive the robot forward, and when you move the right joystick left and right
-         * both motors work to rotate the robot. Combinations of these inputs can be used to create
-         * more complex maneuvers.
-         */
-        arcadeDrive(-gamepad1.left_stick_y, gamepad1.right_stick_x);
+        // Read current bumper states from the Gamepad (Logitech F310 left bumper => gamepad1.left_bumper)
+        boolean curLeftBumper = gamepad2.left_bumper;
+        boolean curRightBumper = gamepad2.right_bumper;
 
-        /*
-         * Here we give the user control of the speed of the launcher motor without automatically
-         * queuing a shot.
-         */
-        if (gamepad1.y) {
+        // L1 rising-edge => toggle brake (no rumble or confirmation)
+        if (curLeftBumper && !prevLeftBumper) {
+            toggleBrakeMode();
+        }
+        prevLeftBumper = curLeftBumper;
+
+        // If brake active, enforce hold; otherwise allow normal driving
+        if (brakeActive) {
+            enforceHoldPosition();
+        } else {
+            // Driving using Logitech F310 joystick axes
+            arcadeDrive(-gamepad1.left_stick_y, gamepad1.right_stick_x);
+        }
+
+        // Launcher manual control
+        if (gamepad2.y) {
             launcher.setVelocity(LAUNCHER_TARGET_VELOCITY);
-        } else if (gamepad1.b) { // stop flywheel
+        } else if (gamepad2.b) {
             launcher.setVelocity(STOP_SPEED);
         }
 
-        /*
-         * Now we call our "Launch" function.
-         */
-        launch(gamepad1.rightBumperWasPressed());
+        // Right bumper rising-edge => request a shot (preserves original behaviour)
+        boolean shotRequested = (curRightBumper && !prevRightBumper);
+        prevRightBumper = curRightBumper;
+        launch(shotRequested);
 
-        /*
-         * Show the state and motor powers
-         */
-        telemetry.addData("State", launchState);
+        // Telemetry (kept minimal)
+        telemetry.addData("LaunchState", launchState);
         telemetry.addData("Motors", "left (%.2f), right (%.2f)", leftPower, rightPower);
-        telemetry.addData("motorSpeed", launcher.getVelocity());
-
+        telemetry.addData("Launcher speed", launcher.getVelocity());
+        telemetry.update();
     }
 
-    /*
-     * Code to run ONCE after the driver hits STOP
-     */
     @Override
     public void stop() {
+        leftDrive.setPower(0);
+        rightDrive.setPower(0);
     }
+
+    // --- Brake implementation ------------------------------------------------
+
+    private void toggleBrakeMode() {
+        if (!brakeActive) {
+            enableBrakeMode();
+        } else {
+            disableBrakeMode();
+        }
+    }
+
+    private void enableBrakeMode() {
+        // Save previous modes
+        leftPrevMode = leftDrive.getMode();
+        rightPrevMode = rightDrive.getMode();
+
+        // Capture current encoder positions
+        int leftPos = leftDrive.getCurrentPosition();
+        int rightPos = rightDrive.getCurrentPosition();
+
+        // Set targets to current positions
+        leftDrive.setTargetPosition(leftPos);
+        rightDrive.setTargetPosition(rightPos);
+
+        // Use RUN_TO_POSITION to actively hold position
+        leftDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        rightDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+
+        // Ensure strong braking behavior
+        leftDrive.setZeroPowerBehavior(BRAKE);
+        rightDrive.setZeroPowerBehavior(BRAKE);
+
+        // Command full power so controller actively resists external forces
+        leftDrive.setPower(1.0);
+        rightDrive.setPower(1.0);
+
+        brakeActive = true;
+    }
+
+    private void disableBrakeMode() {
+        // Stop power before changing modes
+        leftDrive.setPower(0.0);
+        rightDrive.setPower(0.0);
+
+        // Restore previous run modes (or default to RUN_USING_ENCODER)
+        if (leftPrevMode != null) {
+            leftDrive.setMode(leftPrevMode);
+        } else {
+            leftDrive.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        }
+        if (rightPrevMode != null) {
+            rightDrive.setMode(rightPrevMode);
+        } else {
+            rightDrive.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
+        }
+
+        // Keep zeroPowerBehavior as BRAKE (safe default)
+        leftDrive.setZeroPowerBehavior(BRAKE);
+        rightDrive.setZeroPowerBehavior(BRAKE);
+
+        brakeActive = false;
+    }
+
+    private void enforceHoldPosition() {
+        // Re-apply target positions and full power every loop to ensure hold
+        int leftTarget = leftDrive.getTargetPosition();
+        int rightTarget = rightDrive.getTargetPosition();
+
+        leftDrive.setTargetPosition(leftTarget);
+        rightDrive.setTargetPosition(rightTarget);
+
+        // Ensure run mode is RUN_TO_POSITION
+        if (leftDrive.getMode() != DcMotor.RunMode.RUN_TO_POSITION) {
+            leftDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        }
+        if (rightDrive.getMode() != DcMotor.RunMode.RUN_TO_POSITION) {
+            rightDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
+        }
+
+        leftDrive.setPower(1.0);
+        rightDrive.setPower(1.0);
+    }
+
+    // --- Driving & launching -----------------------------------------------
 
     void arcadeDrive(double forward, double rotate) {
         leftPower = forward + rotate;
         rightPower = forward - rotate;
 
-        /*
-         * Send calculated power to wheels
-         */
         leftDrive.setPower(leftPower);
         rightDrive.setPower(rightPower);
     }
