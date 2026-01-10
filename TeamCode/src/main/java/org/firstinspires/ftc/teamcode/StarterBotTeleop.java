@@ -10,8 +10,9 @@
  * of conditions and the following disclaimer.
  *
  * Redistributions in binary form must reproduce the above copyright notice, this
- * list of conditions and the following disclaimer in the documentation and/or
- * other materials provided with the distribution.
+ * list of conditions must reproduce the above copyright notice, this list of
+ * conditions and the following disclaimer in the documentation and/or other
+ * materials provided with the distribution.
  *
  * Neither the name of FIRST nor the names of its contributors may be used to
  * endorse or promote products derived from this software without specific prior
@@ -44,47 +45,34 @@ import com.qualcomm.robotcore.hardware.PIDFCoefficients;
 import com.qualcomm.robotcore.util.ElapsedTime;
 
 /*
- * StarterBotTeleopWithToggleBrake (Logitech F310 friendly)
+ * StarterBotTeleopMecanums (Logitech F310 compatible)
  *
- * - Preserves original teleop functionality (arcade drive, launcher velocity control,
- *   feeder servos and launch state machine).
- * - Adds a toggleable, robust "hold position" brake bound to L1 (left bumper on Logitech F310).
- *     * Press L1 once to toggle Brake Mode ON, press again to toggle OFF.
- * - No rumble or other confirmation is performed when toggling (per request).
+ * Adjustments:
+ * - Uses manual rising-edge detection for the right bumper (Logitech F310 mapping) instead of
+ *   rightBumperWasPressed() helper to ensure compatibility.
  *
- * Brake implementation details:
- * - When enabled we:
- *     * save the drive motors' current run mode,
- *     * record the current encoder positions,
- *     * set the motors to RUN_TO_POSITION with their current position as the target,
- *     * set motor power to 1.0 so the controller actively holds position,
- *     * ensure zeroPowerBehavior is BRAKE and repeatedly force power to the motors while
- *       brake mode is active.
- * - When disabled we:
- *     * restore the motors' previous run modes and allow normal arcade driving to resume.
- *
- * Note: This actively holds position; extreme physical forces may still move the robot if
- * the motors/gearbox/current limit cannot supply the torque required.
+ * All original mecanum + launcher/feeder behavior preserved.
  */
 
-@TeleOp(name = "StarterBotTeleop (Toggle Brake L1 - F310)", group = "StarterBot")
+@TeleOp(name = "TeleopMain", group = "StarterBot")
 //@Disabled
 public class StarterBotTeleop extends OpMode {
-    final double FEED_TIME_SECONDS = 0.5; // The feeder servos run this long when a shot is requested.
-    final double STOP_SPEED = 0.0; // Servo stop
-    final double FULL_SPEED = 0.75;
+    final double FEED_TIME_SECONDS = 0.50; //The feeder servos run this long when a shot is requested.
+    final double STOP_SPEED = 0.0; //We send this power to the servos when we want them to stop.
+    final double FULL_SPEED = 1.0;
 
-    final double LAUNCHER_TARGET_VELOCITY = 1350;
-    final double LAUNCHER_MIN_VELOCITY = 1300;
+    final double LAUNCHER_TARGET_VELOCITY = 1300;
+    final double LAUNCHER_MIN_VELOCITY = 1250;
 
-    // Drive & mechanism members
-    private DcMotor leftDrive = null;
-    private DcMotor rightDrive = null;
+    // Declare OpMode members.
+    private DcMotor leftFrontDrive = null;
+    private DcMotor rightFrontDrive = null;
+    private DcMotor leftBackDrive = null;
+    private DcMotor rightBackDrive = null;
     private DcMotorEx launcher = null;
     private CRServo leftFeeder = null;
     private CRServo rightFeeder = null;
 
-    // Timers & state
     ElapsedTime feederTimer = new ElapsedTime();
 
     private enum LaunchState {
@@ -93,46 +81,61 @@ public class StarterBotTeleop extends OpMode {
         LAUNCH,
         LAUNCHING,
     }
+
     private LaunchState launchState;
 
-    // Drive telemetry
-    double leftPower;
-    double rightPower;
+    // Drive powers for telemetry
+    double leftFrontPower;
+    double rightFrontPower;
+    double leftBackPower;
+    double rightBackPower;
 
-    // Brake toggle state
-    private boolean brakeActive = false;
-    private DcMotor.RunMode leftPrevMode = null;
-    private DcMotor.RunMode rightPrevMode = null;
-
-    // Manual rising-edge detection state (works for Logitech F310 mapping)
-    private boolean prevLeftBumper = false;   // for L1 toggle
-    private boolean prevRightBumper = false;  // for right bumper launch
+    // Manual rising-edge detection state for Logitech F310 right bumper
+    private boolean prevRightBumper = false;
 
     @Override
     public void init() {
         launchState = LaunchState.IDLE;
 
-        // Hardware map
-        leftDrive = hardwareMap.get(DcMotor.class, "left_drive");
-        rightDrive = hardwareMap.get(DcMotor.class, "right_drive");
+        /*
+         * Initialize the hardware variables. Note that the strings used here as parameters
+         * to 'get' must correspond to the names assigned during the robot configuration
+         * step.
+         */
+        leftFrontDrive = hardwareMap.get(DcMotor.class, "left_front_drive");
+        rightFrontDrive = hardwareMap.get(DcMotor.class, "right_front_drive");
+        leftBackDrive = hardwareMap.get(DcMotor.class, "left_back_drive");
+        rightBackDrive = hardwareMap.get(DcMotor.class, "right_back_drive");
         launcher = hardwareMap.get(DcMotorEx.class, "launcher");
         leftFeeder = hardwareMap.get(CRServo.class, "left_feeder");
         rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
 
-        // Motor directions
-        leftDrive.setDirection(DcMotor.Direction.REVERSE);
-        rightDrive.setDirection(DcMotor.Direction.FORWARD);
+        /*
+         * Motor directions - reverse left side so pushing forward on the stick makes the robot go forward.
+         */
+        leftFrontDrive.setDirection(DcMotor.Direction.REVERSE);
+        rightFrontDrive.setDirection(DcMotor.Direction.FORWARD);
+        leftBackDrive.setDirection(DcMotor.Direction.REVERSE);
+        rightBackDrive.setDirection(DcMotor.Direction.FORWARD);
 
-        // Launcher encoder mode & PIDF
+        /*
+         * Launcher configuration
+         */
         launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
         launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER, new PIDFCoefficients(300, 0, 0, 10));
         launcher.setZeroPowerBehavior(BRAKE);
 
-        // Drive brake behavior by default (safe)
-        leftDrive.setZeroPowerBehavior(BRAKE);
-        rightDrive.setZeroPowerBehavior(BRAKE);
+        /*
+         * Drive motors brake behavior
+         */
+        leftFrontDrive.setZeroPowerBehavior(BRAKE);
+        rightFrontDrive.setZeroPowerBehavior(BRAKE);
+        leftBackDrive.setZeroPowerBehavior(BRAKE);
+        rightBackDrive.setZeroPowerBehavior(BRAKE);
 
-        // Initialize feeders
+        /*
+         * Initialize feeders
+         */
         leftFeeder.setPower(STOP_SPEED);
         rightFeeder.setPower(STOP_SPEED);
         leftFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
@@ -141,146 +144,77 @@ public class StarterBotTeleop extends OpMode {
     }
 
     @Override
-    public void init_loop() { }
+    public void init_loop() {
+    }
 
     @Override
-    public void start() { }
+    public void start() {
+    }
 
     @Override
     public void loop() {
-        // Read current bumper states from the Gamepad (Logitech F310 left bumper => gamepad1.left_bumper)
-        boolean curLeftBumper = gamepad2.left_bumper;
-        boolean curRightBumper = gamepad2.right_bumper;
+        /*
+         * Read joystick inputs for mecanum drive (Logitech F310 uses the same gamepad axes)
+         * forward: -left_stick_y
+         * strafe:  left_stick_x
+         * rotate:  right_stick_x
+         */
+        mecanumDrive(gamepad2.left_stick_y, gamepad2.left_stick_x, gamepad2.right_stick_x);
+        //mecanumDrive(-gamepad1.right_stick_y, gamepad1.right_stick_x, gamepad1.right_stick_x);
 
-        // L1 rising-edge => toggle brake (no rumble or confirmation)
-        if (curLeftBumper && !prevLeftBumper) {
-            toggleBrakeMode();
-        }
-        prevLeftBumper = curLeftBumper;
-
-        // If brake active, enforce hold; otherwise allow normal driving
-        if (brakeActive) {
-            enforceHoldPosition();
-        } else {
-            // Driving using Logitech F310 joystick axes
-            arcadeDrive(-gamepad1.left_stick_y, gamepad1.right_stick_x);
-        }
-
-        // Launcher manual control
-        if (gamepad2.y) {
+        /*
+         * Launcher manual control (Y to spin up, B to stop)
+         */
+        if (gamepad1.y) {
             launcher.setVelocity(LAUNCHER_TARGET_VELOCITY);
-        } else if (gamepad2.b) {
+        } else if (gamepad1.b) {
             launcher.setVelocity(STOP_SPEED);
         }
 
-        // Right bumper rising-edge => request a shot (preserves original behaviour)
+        /*
+         * Right bumper rising-edge detection for requesting a shot (compatible with Logitech F310)
+         */
+        boolean curRightBumper = gamepad1.right_bumper; // boolean field on Gamepad
         boolean shotRequested = (curRightBumper && !prevRightBumper);
         prevRightBumper = curRightBumper;
+
+        /*
+         * Now we call our "Launch" function with the computed rising-edge boolean.
+         */
         launch(shotRequested);
 
-        // Telemetry (kept minimal)
-        telemetry.addData("LaunchState", launchState);
-        telemetry.addData("Motors", "left (%.2f), right (%.2f)", leftPower, rightPower);
-        telemetry.addData("Launcher speed", launcher.getVelocity());
+        /*
+         * Telemetry
+         */
+        telemetry.addData("State", launchState);
+        telemetry.addData("motorSpeed", launcher.getVelocity());
+        telemetry.addData("DrivePowers", "LF(%.2f) RF(%.2f) LB(%.2f) RB(%.2f)",
+                leftFrontPower, rightFrontPower, leftBackPower, rightBackPower);
         telemetry.update();
     }
 
     @Override
     public void stop() {
-        leftDrive.setPower(0);
-        rightDrive.setPower(0);
     }
 
-    // --- Brake implementation ------------------------------------------------
+    void mecanumDrive(double forward, double strafe, double rotate){
 
-    private void toggleBrakeMode() {
-        if (!brakeActive) {
-            enableBrakeMode();
-        } else {
-            disableBrakeMode();
-        }
-    }
+        /* the denominator is the largest motor power (absolute value) or 1
+         * This ensures all the powers maintain the same ratio,
+         * but only if at least one is out of the range [-1, 1]
+         */
+        double denominator = Math.max(Math.abs(forward) + Math.abs(strafe) + Math.abs(rotate), 1);
 
-    private void enableBrakeMode() {
-        // Save previous modes
-        leftPrevMode = leftDrive.getMode();
-        rightPrevMode = rightDrive.getMode();
+        leftFrontPower = (forward + strafe + rotate) / denominator;
+        rightFrontPower = (forward - strafe - rotate) / denominator;
+        leftBackPower = (forward - strafe + rotate) / denominator;
+        rightBackPower = (forward + strafe - rotate) / denominator;
 
-        // Capture current encoder positions
-        int leftPos = leftDrive.getCurrentPosition();
-        int rightPos = rightDrive.getCurrentPosition();
+        leftFrontDrive.setPower(leftFrontPower);
+        rightFrontDrive.setPower(rightFrontPower);
+        leftBackDrive.setPower(leftBackPower);
+        rightBackDrive.setPower(rightBackPower);
 
-        // Set targets to current positions
-        leftDrive.setTargetPosition(leftPos);
-        rightDrive.setTargetPosition(rightPos);
-
-        // Use RUN_TO_POSITION to actively hold position
-        leftDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        rightDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-
-        // Ensure strong braking behavior
-        leftDrive.setZeroPowerBehavior(BRAKE);
-        rightDrive.setZeroPowerBehavior(BRAKE);
-
-        // Command full power so controller actively resists external forces
-        leftDrive.setPower(1.0);
-        rightDrive.setPower(1.0);
-
-        brakeActive = true;
-    }
-
-    private void disableBrakeMode() {
-        // Stop power before changing modes
-        leftDrive.setPower(0.0);
-        rightDrive.setPower(0.0);
-
-        // Restore previous run modes (or default to RUN_USING_ENCODER)
-        if (leftPrevMode != null) {
-            leftDrive.setMode(leftPrevMode);
-        } else {
-            leftDrive.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-        }
-        if (rightPrevMode != null) {
-            rightDrive.setMode(rightPrevMode);
-        } else {
-            rightDrive.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-        }
-
-        // Keep zeroPowerBehavior as BRAKE (safe default)
-        leftDrive.setZeroPowerBehavior(BRAKE);
-        rightDrive.setZeroPowerBehavior(BRAKE);
-
-        brakeActive = false;
-    }
-
-    private void enforceHoldPosition() {
-        // Re-apply target positions and full power every loop to ensure hold
-        int leftTarget = leftDrive.getTargetPosition();
-        int rightTarget = rightDrive.getTargetPosition();
-
-        leftDrive.setTargetPosition(leftTarget);
-        rightDrive.setTargetPosition(rightTarget);
-
-        // Ensure run mode is RUN_TO_POSITION
-        if (leftDrive.getMode() != DcMotor.RunMode.RUN_TO_POSITION) {
-            leftDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        }
-        if (rightDrive.getMode() != DcMotor.RunMode.RUN_TO_POSITION) {
-            rightDrive.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        }
-
-        leftDrive.setPower(1.0);
-        rightDrive.setPower(1.0);
-    }
-
-    // --- Driving & launching -----------------------------------------------
-
-    void arcadeDrive(double forward, double rotate) {
-        leftPower = forward + rotate;
-        rightPower = forward - rotate;
-
-        leftDrive.setPower(leftPower);
-        rightDrive.setPower(rightPower);
     }
 
     void launch(boolean shotRequested) {
