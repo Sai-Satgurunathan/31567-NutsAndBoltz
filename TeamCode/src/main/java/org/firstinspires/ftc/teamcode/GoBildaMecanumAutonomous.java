@@ -14,171 +14,166 @@ import com.qualcomm.robotcore.util.ElapsedTime;
 @com.qualcomm.robotcore.eventloop.opmode.Autonomous(name="GoBilda Mecanum Autonomous", group="Linear Opmode")
 public class GoBildaMecanumAutonomous extends LinearOpMode {
 
+    // ===== Drive Motors =====
     private DcMotor frontLeft, frontRight, backLeft, backRight;
 
-    final double FEED_TIME_SECONDS = 2.50; //The feeder servos run this long when a shot is requested.
-    final double STOP_SPEED = 0.0; //We send this power to the servos when we want them to stop.
-    final double FULL_SPEED = 1.0;
+    // ===== Launcher =====
+    private DcMotorEx launcher;
+    private CRServo leftFeeder, rightFeeder;
 
+    // ===== Launcher Constants (MATCH TELEOP) =====
     final double LAUNCHER_TARGET_VELOCITY = 1300;
     final double LAUNCHER_MIN_VELOCITY = 1250;
-    private DcMotorEx launcher = null;
-    private CRServo leftFeeder = null;
-    private CRServo rightFeeder = null;
-    ElapsedTime feederTimer = new ElapsedTime();
 
-    private enum LaunchState {
-        IDLE,
-        SPIN_UP,
-        LAUNCH,
-        LAUNCHING,
-        DONE,
-    }
-
-    private LaunchState launchState;
+    final double FEED_TIME = 0.50;              // Push one ring
+    final double BETWEEN_SHOTS_PAUSE = 0.20;    // Anti-jam pause
+    final double SPINUP_TIMEOUT = 3.0;          // Failsafe timeout
 
     @Override
     public void runOpMode() {
-        launchState = LaunchState.IDLE;
 
-        // Initialize motors
-        frontLeft = hardwareMap.dcMotor.get("left_front_drive");
+
+        // ===== Hardware Mapping =====
+        frontLeft  = hardwareMap.dcMotor.get("left_front_drive");
         frontRight = hardwareMap.dcMotor.get("right_front_drive");
-        backLeft = hardwareMap.dcMotor.get("left_back_drive");
-        backRight = hardwareMap.dcMotor.get("right_back_drive");
-        launcher = hardwareMap.get(DcMotorEx.class, "launcher");
+        backLeft   = hardwareMap.dcMotor.get("left_back_drive");
+        backRight  = hardwareMap.dcMotor.get("right_back_drive");
+
+        launcher   = hardwareMap.get(DcMotorEx.class, "launcher");
         leftFeeder = hardwareMap.get(CRServo.class, "left_feeder");
-        rightFeeder = hardwareMap.get(CRServo.class, "right_feeder");
+        rightFeeder= hardwareMap.get(CRServo.class, "right_feeder");
 
-        // Reverse the right side motors if necessary
-        frontRight.setDirection(DcMotor.Direction.REVERSE);
-        backRight.setDirection(DcMotor.Direction.REVERSE);
+        // ===== Motor Directions (MATCH TELEOP) =====
+        frontLeft.setDirection(DcMotor.Direction.REVERSE);
+        backLeft.setDirection(DcMotor.Direction.REVERSE);
+        frontRight.setDirection(DcMotor.Direction.FORWARD);
+        backRight.setDirection(DcMotor.Direction.FORWARD);
 
-        /*
-         * Launcher configuration
-         */
+        // ===== Drive Motor Behavior =====
+        frontLeft.setZeroPowerBehavior(BRAKE);
+        frontRight.setZeroPowerBehavior(BRAKE);
+        backLeft.setZeroPowerBehavior(BRAKE);
+        backRight.setZeroPowerBehavior(BRAKE);
+
+        // ===== Launcher Setup =====
         launcher.setMode(DcMotor.RunMode.RUN_USING_ENCODER);
-        launcher.setPIDFCoefficients(DcMotor.RunMode.RUN_USING_ENCODER, new PIDFCoefficients(300, 0, 0, 10));
         launcher.setZeroPowerBehavior(BRAKE);
 
-
-        // Set initial motor modes
-        frontLeft.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-        frontRight.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-        backLeft.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-        backRight.setMode(DcMotor.RunMode.STOP_AND_RESET_ENCODER);
-
-        /*
-         * Initialize feeders
-         */
-        leftFeeder.setPower(STOP_SPEED);
-        rightFeeder.setPower(STOP_SPEED);
+        // ===== Feeder Setup =====
         leftFeeder.setDirection(DcMotorSimple.Direction.REVERSE);
+        leftFeeder.setPower(0);
+        rightFeeder.setPower(0);
 
-        telemetry.addData("Status", "Autonomous Initialized");
+        telemetry.addLine("Autonomous Initialized");
+        telemetry.update();
 
-        // Wait for the game to start (driver presses PLAY)
         waitForStart();
+        if (!opModeIsActive()) return;
 
-        // Move forward 26 inches
-        moveInches(26, 0.5, MoveDirection.FORWARD);
+        // ==============================
+        // 1️⃣ Move forward 26 inches
+        // ==============================
+        moveInches(26, 0.5, MoveDirection.BACKWARD);
 
+        // ==============================
+        // 2️⃣ Spin up launcher with failsafe
+        // ==============================
+        launcher.setVelocity(LAUNCHER_TARGET_VELOCITY);
+        ElapsedTime spinupTimer = new ElapsedTime();
 
-        while (launchState != LaunchState.DONE)
-        {
-            launch();
+        while (opModeIsActive()
+                && launcher.getVelocity() < LAUNCHER_MIN_VELOCITY
+                && spinupTimer.seconds() < SPINUP_TIMEOUT) {
+
+            telemetry.addData("Launcher Velocity", launcher.getVelocity());
+            telemetry.addData("Target Velocity", LAUNCHER_TARGET_VELOCITY);
+            telemetry.addData("Spinup Time", spinupTimer.seconds());
+            telemetry.update();
+            idle();
         }
 
-        // Move forward 26 inches
-        moveInches(26, 0.5, MoveDirection.FORWARD);
+        // FAILSAFE: abort shooting if never reached speed
+        if (launcher.getVelocity() < LAUNCHER_MIN_VELOCITY) {
+            telemetry.addLine("ERROR: Launcher failed to reach speed!");
+            telemetry.update();
+            return;
+        }
 
-        // Strafe right 12 inches
+        // ==============================
+        // 3️⃣ Shoot 3 rings
+        // ==============================
+        ElapsedTime shotTimer = new ElapsedTime();
+
+        for (int i = 0; i < 3 && opModeIsActive(); i++) {
+
+            // Feed ring
+            leftFeeder.setPower(1.0);
+            rightFeeder.setPower(1.0);
+            shotTimer.reset();
+
+            while (opModeIsActive() && shotTimer.seconds() < FEED_TIME) {
+                telemetry.addData("Shot", i + 1);
+                telemetry.addData("Launcher Velocity", launcher.getVelocity());
+                telemetry.update();
+                idle();
+            }
+
+            // Stop feeders
+            leftFeeder.setPower(0);
+            rightFeeder.setPower(0);
+
+            // Anti-jam pause
+            shotTimer.reset();
+            while (opModeIsActive() && shotTimer.seconds() < BETWEEN_SHOTS_PAUSE) {
+                idle();
+            }
+        }
+
+        // ==============================
+        // 4️⃣ Move forward 26 inches
+        // ==============================
+        moveInches(26, 0.5, MoveDirection.BACKWARD);
+
+        // ==============================
+        // 5️⃣ Strafe LEFT 18 inches
+        // ==============================
         moveInches(18, 0.5, MoveDirection.RIGHT);
-
-
-        // Rotate 90 degrees clockwise
-        //rotateDegrees(90, 0.5);
-
-        // Move backward 12 inches
-        //moveInches(12, 0.5, MoveDirection.BACKWARD);
     }
 
-    private void launch()
-    {
-        telemetry.addData("Status", ""+launchState);
-        switch (launchState) {
-            case IDLE:
-                //if (shotRequested) {
-                    launchState = LaunchState.SPIN_UP;
-                  //  sleep(2000);
-                //}
-                break;
-            case SPIN_UP:
-                launcher.setVelocity(LAUNCHER_TARGET_VELOCITY);
-                if (launcher.getVelocity() > LAUNCHER_MIN_VELOCITY) {
-                    launchState = LaunchState.LAUNCH;
-                }
-                break;
-            case LAUNCH:
-                leftFeeder.setPower(FULL_SPEED);
-                rightFeeder.setPower(FULL_SPEED);
-                feederTimer.reset();
-                launchState = LaunchState.LAUNCHING;
-                break;
-            case LAUNCHING:
-                if (feederTimer.seconds() > FEED_TIME_SECONDS) {
-                    launchState = LaunchState.IDLE;
-                    leftFeeder.setPower(STOP_SPEED);
-                    rightFeeder.setPower(STOP_SPEED);
-                    launchState = LaunchState.DONE;
-                }
-                break;
-        }
-    }
-
+    // ==================================================
+    // ================= DRIVE HELPERS ==================
+    // ==================================================
 
     enum MoveDirection { FORWARD, BACKWARD, LEFT, RIGHT }
 
     private void moveInches(double inches, double power, MoveDirection direction) {
-        int countsPerRevolution = 537; // GoBilda yellow jacket 312rpm motor, adjust as needed
-        double wheelDiameterInches = 4.0; // Standard mecanum wheels
-        double countsPerInch = countsPerRevolution / (Math.PI * wheelDiameterInches);
 
-        int targetCounts = (int)(inches * countsPerInch);
+        int countsPerRev = 537;     // GoBilda 312 RPM motor
+        double wheelDiameter = 4.0;
+        double countsPerInch = countsPerRev / (Math.PI * wheelDiameter);
+        int counts = (int)(inches * countsPerInch);
 
-        int flTarget = 0, frTarget = 0, blTarget = 0, brTarget = 0;
+        int fl = 0, fr = 0, bl = 0, br = 0;
 
-        switch(direction) {
+        switch (direction) {
             case FORWARD:
-                flTarget = targetCounts;
-                frTarget = targetCounts;
-                blTarget = targetCounts;
-                brTarget = targetCounts;
+                fl = fr = bl = br = counts;
                 break;
             case BACKWARD:
-                flTarget = -targetCounts;
-                frTarget = -targetCounts;
-                blTarget = -targetCounts;
-                brTarget = -targetCounts;
+                fl = fr = bl = br = -counts;
                 break;
-            case LEFT: // Strafe
-                flTarget = -targetCounts;
-                frTarget = targetCounts;
-                blTarget = targetCounts;
-                brTarget = -targetCounts;
+            case LEFT:
+                fl = -counts; fr = counts; bl = counts; br = -counts;
                 break;
-            case RIGHT: // Strafe
-                flTarget = targetCounts;
-                frTarget = -targetCounts;
-                blTarget = -targetCounts;
-                brTarget = targetCounts;
+            case RIGHT:
+                fl = counts; fr = -counts; bl = -counts; br = counts;
                 break;
         }
 
-        frontLeft.setTargetPosition(frontLeft.getCurrentPosition() + flTarget);
-        frontRight.setTargetPosition(frontRight.getCurrentPosition() + frTarget);
-        backLeft.setTargetPosition(backLeft.getCurrentPosition() + blTarget);
-        backRight.setTargetPosition(backRight.getCurrentPosition() + brTarget);
+        frontLeft.setTargetPosition(frontLeft.getCurrentPosition() + fl);
+        frontRight.setTargetPosition(frontRight.getCurrentPosition() + fr);
+        backLeft.setTargetPosition(backLeft.getCurrentPosition() + bl);
+        backRight.setTargetPosition(backRight.getCurrentPosition() + br);
 
         frontLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
         frontRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
@@ -190,7 +185,9 @@ public class GoBildaMecanumAutonomous extends LinearOpMode {
         backLeft.setPower(power);
         backRight.setPower(power);
 
-        while (opModeIsActive() && (frontLeft.isBusy() && frontRight.isBusy() && backLeft.isBusy() && backRight.isBusy())) {
+        while (opModeIsActive() &&
+                (frontLeft.isBusy() || frontRight.isBusy()
+                        || backLeft.isBusy() || backRight.isBusy())) {
             idle();
         }
 
@@ -198,41 +195,6 @@ public class GoBildaMecanumAutonomous extends LinearOpMode {
         frontRight.setPower(0);
         backLeft.setPower(0);
         backRight.setPower(0);
-    }
-
-    private void rotateDegrees(double degrees, double power) {
-        //  For 360 degrees, estimate wheel base to get encoder counts
-        double robotCircumference = 15.7; //  Assume robot turn circumference (inches), adjust based on your robot
-        double turnInches = robotCircumference * (degrees / 360.0);
-
-        int countsPerRevolution = 537;
-        double wheelDiameterInches = 4.0;
-        double countsPerInch = countsPerRevolution / (Math.PI * wheelDiameterInches);
-        int targetCounts = (int)(turnInches * countsPerInch);
-
-        frontLeft.setTargetPosition(frontLeft.getCurrentPosition() + targetCounts);
-        frontRight.setTargetPosition(frontRight.getCurrentPosition() - targetCounts);
-        backLeft.setTargetPosition(backLeft.getCurrentPosition() + targetCounts);
-        backRight.setTargetPosition(backRight.getCurrentPosition() - targetCounts);
-
-        frontLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        frontRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        backLeft.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-        backRight.setMode(DcMotor.RunMode.RUN_TO_POSITION);
-
-        frontLeft.setPower(power);
-        frontRight.setPower(power);
-        backLeft.setPower(power);
-        backRight.setPower(power);
-
-        while (opModeIsActive() && (frontLeft.isBusy() && frontRight.isBusy() && backLeft.isBusy() && backRight.isBusy())) {
-            idle();
-        }
-
-        frontLeft.setPower(0);
-        frontRight.setPower(0);
-        backLeft.setPower(0);
-        backRight.setPower(0);
-
     }
 }
+
